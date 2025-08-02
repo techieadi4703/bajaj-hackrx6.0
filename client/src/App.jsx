@@ -1,14 +1,22 @@
-import { useState } from 'react'
-
+import { Routes, Route } from 'react-router-dom';
+import Login from './pages/Login';
+import Signup from './pages/Singup';
+import Navbar from './components/Navbar';
+import Homepage from './pages/Homepage';
 
 function App() {
-  const [count, setCount] = useState(0)
-
   return (
-    <div className='bg-gray-400 flex justify-center w-full p-2'>
-      <h1 className='bg-amber-300 w-fit p-2'>Hello from WinnieThePooh</h1>
+   <div className="min-h-screen bg-[#e6f9ff]">
+      <Navbar/>
+      <div className="flex items-center justify-center py-10">
+        <Routes>
+          <Route path='/' element={<Homepage/>} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/signup" element={<Signup />} />
+        </Routes>
+      </div>
     </div>
-  )
+  );
 }
 
 export default App
