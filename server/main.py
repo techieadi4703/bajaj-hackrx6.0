@@ -1,23 +1,26 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List
-import os, json, traceback
-import psycopg2
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from dotenv import load_dotenv
 import requests
+import tempfile
+import os
+import json
 import re
-import ast
+import traceback
+
+from dotenv import load_dotenv
+from functions import file_loader
 
 load_dotenv()
+
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+TEAM_TOKEN = "fa641c0ed8a31d89ec262969f1b0f3371b202957ffd6c6f1996e6dbf102866a5"
 
 app = FastAPI()
 
-# CORS
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,28 +28,17 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# PostgreSQL setup
-conn = psycopg2.connect(
-    dbname="insurance_db",
-    user="charuarora",
-    password="",
-    host="localhost",
-    port="5432"
-)
+security = HTTPBearer()
 
-cursor = conn.cursor()
-
-# Embedding model
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-class QueryInput(BaseModel):
+# Request model
+class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# Fallback if LLM output isn't JSON
 def fallback_extract_answers(text):
     answers = []
     collecting = False
-
     for line in text.splitlines():
         line = line.strip()
         if line.startswith('"answers"') or line.startswith('{ "answers"'):
@@ -60,34 +52,33 @@ def fallback_extract_answers(text):
             line = line.strip().strip('"')
             if line:
                 answers.append(line)
-
     return answers
 
-
 @app.post("/hackrx/run")
-async def ask_query(data: QueryInput):
+async def hackrx_run(data: HackRxRequest, request: Request, token: HTTPAuthorizationCredentials = security):
     try:
+        # === Auth Check ===
+        if token.credentials != TEAM_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid Bearer Token")
+
+        # === Download and save the file ===
+        response = requests.get(data.documents)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download document.")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(response.content)
+            file_path = tmp.name
+
+        # === Load, split, embed, index ===
+        retriever, _ = file_loader(file_path)
+
+        # === Retrieve relevant content ===
         combined_query = " ".join(data.questions)
-        query_emb = embedding_model.encode(combined_query)
+        docs = retriever.get_relevant_documents(combined_query)
+        context = "\n\n".join([doc.page_content for doc in docs[:3]])
 
-        cursor.execute("SELECT chunk, embedding FROM policy_chunks")
-        rows = cursor.fetchall()
-
-        scored = []
-        for chunk_text, emb in rows:
-            if emb is None:
-                continue
-            if isinstance(emb, str):
-                emb = np.array(ast.literal_eval(emb))
-            else:
-                emb = np.array(emb)
-
-            score = 1 - np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb))
-            scored.append((1 - score, chunk_text))
-
-        top_chunks = sorted(scored, reverse=True)[:3]
-        context = "\n\n".join(chunk for _, chunk in top_chunks)
-
+        # === Build LLM prompt ===
         prompt = f"""
 You are an expert insurance policy analyst.
 
@@ -119,10 +110,12 @@ Customer Queries:
 
 Relevant Clauses:
 {context}
+
 IMPORTANT: Return exactly all the given queries answers in the same order as the queries. Do NOT skip or combine. Only respond in valid JSON as shown above.
 """
 
-        response = requests.post(
+        # === Call LLM ===
+        llm_response = requests.post(
             "https://api.together.xyz/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {TOGETHER_API_KEY}",
@@ -138,22 +131,23 @@ IMPORTANT: Return exactly all the given queries answers in the same order as the
             }
         )
 
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"LLM Error: {response.text}")
+        if llm_response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"LLM Error: {llm_response.text}")
 
-        reply = response.json()["choices"][0]["message"]["content"]
+        reply = llm_response.json()["choices"][0]["message"]["content"]
 
+        # === Extract answers from JSON ===
         match = re.search(r'\{\s*"answers"\s*:\s*\[.*?\]\s*\}', reply, re.DOTALL)
         if match:
             structured = json.loads(match.group())
         else:
             answers = fallback_extract_answers(reply)
             if not answers:
-                raise ValueError(f"No valid JSON answers found. LLM response:\n\n{reply}")
+                raise ValueError("No valid JSON output from LLM.")
             structured = {"answers": answers}
 
-        return {"response": structured}
+        return structured
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
